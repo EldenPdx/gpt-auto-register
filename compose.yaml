@@ -1,0 +1,10 @@
+services:
+  webui:
+    build: .
+    init: true
+    environment:
+      WATCHFILES_FORCE_POLLING: "true"
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - .:/app

@@ -123,6 +123,12 @@ class _TlsRetrySession:
     def put(self, *args, **kwargs):
         return self._call_with_retry("put", *args, **kwargs)
 
+    def patch(self, *args, **kwargs):
+        return self._call_with_retry("patch", *args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        return self._call_with_retry("delete", *args, **kwargs)
+
 
 def create_http_session(
     proxy: Optional[str] = None,

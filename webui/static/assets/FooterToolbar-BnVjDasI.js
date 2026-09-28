@@ -1,0 +1,1 @@
+import{au as s,o as a,c as r,g as o,Y as t}from"./index-ovecc_M2.js";const c={class:"footer-toolbar"},d={class:"ft-left"},n={class:"ft-right"},_={__name:"FooterToolbar",setup(l){return(e,f)=>(a(),r("div",c,[o("div",d,[t(e.$slots,"left",{},void 0,!0)]),o("div",n,[t(e.$slots,"default",{},void 0,!0)])]))}},u=s(_,[["__scopeId","data-v-d2120ac0"]]);export{u as F};

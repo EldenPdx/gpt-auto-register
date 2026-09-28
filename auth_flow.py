@@ -5,6 +5,8 @@
   -> signup -> send_otp -> verify_otp -> create_account
   -> redirect_chain -> auth_session -> (optional) oauth_token_exchange
 """
+from __future__ import annotations
+
 import json
 import base64
 import hashlib
@@ -653,13 +655,16 @@ class AuthFlow:
         构建用于获取 refresh_token 的 Codex OAuth 授权 URL。
         参考 any-auto-register 的实现：独立 client_id + redirect_uri + 可控 PKCE。
         """
-        client_id = (os.getenv("OAUTH_CODEX_CLIENT_ID", "") or "").strip() or "app_EMoamEEZ73f0CkXaXp7hrann"
-        redirect_uri = (os.getenv("OAUTH_CODEX_REDIRECT_URI", "") or "").strip() or "http://localhost:1455/auth/callback"
-        scope = (os.getenv("OAUTH_CODEX_SCOPE", "") or "").strip() or "openid email profile offline_access"
+        client_id = self._get_env("OAUTH_CODEX_CLIENT_ID", "").strip() or "app_EMoamEEZ73f0CkXaXp7hrann"
+        redirect_uri = self._get_env("OAUTH_CODEX_REDIRECT_URI", "").strip() or "http://localhost:1455/auth/callback"
+        scope = self._get_env("OAUTH_CODEX_SCOPE", "").strip() or (
+            "openid profile email offline_access "
+            "api.connectors.read api.connectors.invoke"
+        )
         state = self._b64url_no_pad(secrets.token_bytes(24))
         verifier, challenge = self._build_pkce_pair()
         prompt = (
-            (os.getenv("OAUTH_CODEX_PROMPT", "login") or "").strip()
+            self._get_env("OAUTH_CODEX_PROMPT", "login").strip()
             if prompt_override is None
             else (prompt_override or "").strip()
         )
@@ -673,7 +678,13 @@ class AuthFlow:
             "code_challenge_method": "S256",
             "id_token_add_organizations": "true",
             "codex_cli_simplified_flow": "true",
+            "originator": "codex_cli_rs",
         }
+        if self.result.email:
+            params["login_hint"] = self.result.email
+        allowed_workspace_id = self._get_env("OAUTH_ALLOWED_WORKSPACE_ID", "").strip()
+        if allowed_workspace_id:
+            params["allowed_workspace_id"] = allowed_workspace_id
         if prompt:
             params["prompt"] = prompt
         auth_url = f"https://auth.openai.com/oauth/authorize?{urlencode(params)}"
@@ -786,7 +797,7 @@ class AuthFlow:
         if not code:
             logger.warning("Codex callback 缺少 code")
             return False
-        if expected_state and got_state and got_state != expected_state:
+        if expected_state and got_state != expected_state:
             logger.warning("Codex callback state 不匹配，期望=%s 实际=%s", expected_state[:20], got_state[:20])
             return False
 
@@ -795,7 +806,8 @@ class AuthFlow:
             "Accept": "application/json",
             "Origin": "https://auth.openai.com",
             "Referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            "User-Agent": self._ua,
+            "User-Agent": "codex_cli_rs/0.146.0",
+            "originator": "codex_cli_rs",
         }
         form = {
             "grant_type": "authorization_code",
@@ -2363,6 +2375,19 @@ class AuthFlow:
             headers["openai-sentinel-token"] = self._last_sentinel_token
         if getattr(self, "_last_sentinel_so_token", ""):
             headers["openai-sentinel-so-token"] = self._last_sentinel_so_token
+        sentinel_resp = self.session.post(
+            "https://auth.openai.com/api/accounts/password/verify",
+            headers=headers,
+            json={"password": "sentinel"},
+            timeout=30,
+        )
+        self._trace_http("login_password_verify_sentinel", sentinel_resp)
+        if sentinel_resp.status_code != 401:
+            body = (sentinel_resp.text or "")[:260]
+            raise RuntimeError(
+                f"密码 sentinel 预请求失败: 预期 HTTP 401，"
+                f"实际 HTTP {sentinel_resp.status_code} - {body}"
+            )
         resp = self.session.post(
             "https://auth.openai.com/api/accounts/password/verify",
             headers=headers,
@@ -3658,6 +3683,8 @@ class AuthFlow:
             continue_url = self._extract_continue_url_from_step(otp_resp)
             continue_url = self._normalize_continue_url(continue_url)
             if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
+                if self._env_flag("TEAM_SKIP_ADD_PHONE", "0"):
+                    raise RuntimeError("add_phone_required: Team 运维账号命中绑手机门禁，按轮转规范跳过")
                 continue_url = self._normalize_continue_url(
                     self._handle_add_phone_verification(continue_url=continue_url)
                 )
@@ -3734,16 +3761,23 @@ class AuthFlow:
                 user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
                 if isinstance(user_obj, dict):
                     detected_email = detected_email or (user_obj.get("email", "") or "")
-                new_session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
+                new_session_token = (
+                    session_data.get("sessionToken", "")
+                    or session_data.get("session_token", "")
+                    or self.session.cookies.get("__Secure-next-auth.session-token", "")
+                )
                 if new_access_token:
                     access_token = new_access_token
+                    session_token = new_session_token or session_token
                     logger.info("access_token 刷新成功")
                 else:
-                    logger.warning(f"access_token 刷新失败 (status={resp.status_code}), 使用原 token")
-                if new_session_token:
-                    session_token = new_session_token
+                    access_token = ""
+                    session_token = ""
+                    logger.warning(f"已保存 session 无法刷新 access_token (status={resp.status_code})")
             except Exception as e:
-                logger.warning(f"刷新 access_token 失败: {e}, 使用原 token")
+                access_token = ""
+                session_token = ""
+                logger.warning(f"已保存 session 验证失败: {e}")
         elif access_token:
             # 没有 session_token, 尝试通过 access_token 获取
             logger.info("未提供 session_token, 尝试通过 access_token 获取...")
@@ -3759,7 +3793,16 @@ class AuthFlow:
                 user_obj = session_data.get("user", {}) if isinstance(session_data, dict) else {}
                 if isinstance(user_obj, dict):
                     detected_email = detected_email or (user_obj.get("email", "") or "")
-                session_token = self.session.cookies.get("__Secure-next-auth.session-token", "")
+                session_token = (
+                    self.session.cookies.get("__Secure-next-auth.session-token", "")
+                    or session_data.get("sessionToken", "")
+                    or session_data.get("session_token", "")
+                )
+                access_token = (
+                    session_data.get("accessToken", "")
+                    or session_data.get("access_token", "")
+                    or access_token
+                )
                 if session_token:
                     logger.info("通过 access_token 获取 session_token 成功")
                 else:
@@ -3791,4 +3834,3 @@ class AuthFlow:
         self.result.email = detected_email or ""
         logger.info("使用已有凭证初始化完成")
         return self.result
-

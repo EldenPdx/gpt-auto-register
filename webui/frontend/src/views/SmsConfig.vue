@@ -45,7 +45,6 @@ async function load() {
   try {
     const { config } = await getSmsConfig()
     provider.value = config.sms_provider || 'smsbower'
-    await loadCountries(provider.value)
     enabled.value = config.sms_enabled === '1'
     apiKey.value = ''
     apiKeyPh.value = config.sms_api_key === '***' ? '已设置（留空不修改）' : '粘贴接码平台 API Key'
@@ -58,6 +57,7 @@ async function load() {
     allowed.value = (config.sms_allowed_countries || '').split(',').map((s) => s.trim()).filter(Boolean)
     maxPhoneAttempts.value = config.sms_max_phone_attempts || ''
     perPhoneTimeout.value = config.sms_per_phone_timeout || '80'
+    await loadCountries(provider.value)
   } catch (e) { ElMessage.error(e.message) }
 }
 

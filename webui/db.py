@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -96,6 +97,38 @@ def init_db():
             error           TEXT,
             error_category  TEXT         -- network / account / unknown
         );
+
+        CREATE TABLE IF NOT EXISTS team_workspaces (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            name                  TEXT NOT NULL,
+            workspace_id          TEXT NOT NULL UNIQUE,
+            owner_email           TEXT,
+            owner_access_token    TEXT,
+            owner_session_token   TEXT,
+            owner_device_id       TEXT,
+            proxy                 TEXT,
+            client_build_number   TEXT,
+            client_version        TEXT,
+            sub2api_url           TEXT,
+            sub2api_api_key       TEXT,
+            sub2api_group_ids     TEXT NOT NULL DEFAULT '',
+            sub2api_timeout       INTEGER NOT NULL DEFAULT 30,
+            created_at            REAL NOT NULL,
+            updated_at            REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS team_account_bindings (
+            workspace_local_id    INTEGER NOT NULL,
+            email                 TEXT NOT NULL,
+            binding_id            TEXT NOT NULL,
+            generation            INTEGER NOT NULL DEFAULT 1,
+            request_id            TEXT NOT NULL,
+            phase                 TEXT NOT NULL DEFAULT 'pending',
+            remote_account_id     TEXT,
+            last_error            TEXT,
+            updated_at            REAL NOT NULL,
+            PRIMARY KEY (workspace_local_id, email)
+        );
     """)
     con.commit()
     # 老 DB migrate：error_category 在后期才加，对已建表补列
@@ -134,6 +167,13 @@ def init_db():
     if "totp_factor_id" not in reg_cols:
         con.execute("ALTER TABLE registered ADD COLUMN totp_factor_id TEXT")
         con.commit()
+
+    cur = con.execute("PRAGMA table_info(team_workspaces)")
+    team_cols = {r[1] for r in cur.fetchall()}
+    for column in ("client_build_number", "client_version"):
+        if column not in team_cols:
+            con.execute(f"ALTER TABLE team_workspaces ADD COLUMN {column} TEXT")
+    con.commit()
 
 
 # ──────────────────────── outlook 号池 ────────────────────────
@@ -738,6 +778,36 @@ def update_plus_check(email: str, plus_info: dict) -> None:
         con.commit()
 
 
+def update_team_usage(email: str, workspace_id: str, usage: dict) -> bool:
+    """Persist the latest usage probe per workspace without touching credentials."""
+    email = (email or "").strip().lower()
+    workspace_id = (workspace_id or "").strip()
+    if not email or not workspace_id:
+        return False
+    with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT extra_json FROM registered WHERE email=?", (email,)
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            extra = json.loads(row["extra_json"] or "{}")
+        except Exception:
+            extra = {}
+        team_usage = extra.get("team_usage")
+        if not isinstance(team_usage, dict):
+            team_usage = {}
+        team_usage[workspace_id] = dict(usage or {})
+        extra["team_usage"] = team_usage
+        con.execute(
+            "UPDATE registered SET extra_json=? WHERE email=?",
+            (json.dumps(extra, ensure_ascii=False), email),
+        )
+        con.commit()
+        return True
+
+
 def _registered_where(filt: str) -> str:
     if filt == "has_rt":
         return "WHERE length(refresh_token) > 0"
@@ -871,6 +941,153 @@ def get_registered(email: str) -> Optional[dict]:
             out["extra"] = {}
     out.pop("extra_json", None)
     return out
+
+
+# ──────────────────────── Team 工作空间 ────────────────────────
+
+
+_TEAM_WORKSPACE_FIELDS = (
+    "name", "workspace_id", "owner_email", "owner_access_token",
+    "owner_session_token", "owner_device_id", "proxy", "sub2api_url",
+    "client_build_number", "client_version", "sub2api_api_key",
+    "sub2api_group_ids", "sub2api_timeout",
+)
+
+
+def save_team_workspace(data: dict) -> dict:
+    """新增或更新一个 Team 工作空间；未传字段保持原值。"""
+    workspace_id = str(data.get("workspace_id") or "").strip()
+    local_id = data.get("id")
+    with _lock:
+        con = _conn()
+        row = None
+        if local_id:
+            row = con.execute(
+                "SELECT * FROM team_workspaces WHERE id=?", (int(local_id),)
+            ).fetchone()
+        elif workspace_id:
+            row = con.execute(
+                "SELECT * FROM team_workspaces WHERE workspace_id=?", (workspace_id,)
+            ).fetchone()
+
+        now = time.time()
+        if row:
+            current = dict(row)
+            merged = {
+                field: data[field] if field in data and data[field] is not None else current[field]
+                for field in _TEAM_WORKSPACE_FIELDS
+            }
+            merged["name"] = str(merged["name"] or "").strip()
+            merged["workspace_id"] = str(merged["workspace_id"] or "").strip()
+            values = [merged[field] for field in _TEAM_WORKSPACE_FIELDS]
+            con.execute(
+                "UPDATE team_workspaces SET "
+                + ", ".join(f"{field}=?" for field in _TEAM_WORKSPACE_FIELDS)
+                + ", updated_at=? WHERE id=?",
+                (*values, now, current["id"]),
+            )
+            result_id = current["id"]
+        else:
+            values = {
+                "name": str(data.get("name") or workspace_id).strip(),
+                "workspace_id": workspace_id,
+                "owner_email": str(data.get("owner_email") or "").strip().lower(),
+                "owner_access_token": str(data.get("owner_access_token") or "").strip(),
+                "owner_session_token": str(data.get("owner_session_token") or "").strip(),
+                "owner_device_id": str(data.get("owner_device_id") or "").strip(),
+                "proxy": str(data.get("proxy") or "").strip(),
+                "client_build_number": str(data.get("client_build_number") or "").strip(),
+                "client_version": str(data.get("client_version") or "").strip(),
+                "sub2api_url": str(data.get("sub2api_url") or "").strip(),
+                "sub2api_api_key": str(data.get("sub2api_api_key") or "").strip(),
+                "sub2api_group_ids": str(data.get("sub2api_group_ids") or "").strip(),
+                "sub2api_timeout": int(data.get("sub2api_timeout") or 30),
+            }
+            cur = con.execute(
+                "INSERT INTO team_workspaces ("
+                + ", ".join(_TEAM_WORKSPACE_FIELDS)
+                + ", created_at, updated_at) VALUES ("
+                + ", ".join("?" for _ in range(len(_TEAM_WORKSPACE_FIELDS) + 2))
+                + ")",
+                (*[values[field] for field in _TEAM_WORKSPACE_FIELDS], now, now),
+            )
+            result_id = cur.lastrowid
+        con.commit()
+        saved = con.execute(
+            "SELECT * FROM team_workspaces WHERE id=?", (result_id,)
+        ).fetchone()
+        return dict(saved)
+
+
+def list_team_workspaces() -> list[dict]:
+    con = _conn()
+    return [
+        dict(row) for row in con.execute(
+            "SELECT * FROM team_workspaces ORDER BY id DESC"
+        ).fetchall()
+    ]
+
+
+def get_team_workspace(local_id: int) -> Optional[dict]:
+    row = _conn().execute(
+        "SELECT * FROM team_workspaces WHERE id=?", (int(local_id),)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def delete_team_workspace(local_id: int) -> bool:
+    with _lock:
+        con = _conn()
+        con.execute(
+            "DELETE FROM team_account_bindings WHERE workspace_local_id=?",
+            (int(local_id),),
+        )
+        cur = con.execute("DELETE FROM team_workspaces WHERE id=?", (int(local_id),))
+        con.commit()
+        return cur.rowcount > 0
+
+
+def get_or_create_team_binding(workspace_local_id: int, email: str) -> dict:
+    email = (email or "").strip().lower()
+    if not email:
+        raise ValueError("email is required")
+    with _lock:
+        con = _conn()
+        row = con.execute(
+            "SELECT * FROM team_account_bindings WHERE workspace_local_id=? AND email=?",
+            (int(workspace_local_id), email),
+        ).fetchone()
+        if not row:
+            now = time.time()
+            con.execute(
+                "INSERT INTO team_account_bindings "
+                "(workspace_local_id, email, binding_id, generation, request_id, phase, updated_at) "
+                "VALUES (?, ?, ?, 1, ?, 'pending', ?)",
+                (int(workspace_local_id), email, uuid.uuid4().hex, str(uuid.uuid4()), now),
+            )
+            con.commit()
+            row = con.execute(
+                "SELECT * FROM team_account_bindings WHERE workspace_local_id=? AND email=?",
+                (int(workspace_local_id), email),
+            ).fetchone()
+        return dict(row)
+
+
+def update_team_binding(workspace_local_id: int, email: str, *, phase: str,
+                        last_error: str = "", remote_account_id: str = "") -> bool:
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            "UPDATE team_account_bindings SET phase=?, last_error=?, "
+            "remote_account_id=CASE WHEN ? != '' THEN ? ELSE remote_account_id END, "
+            "updated_at=? WHERE workspace_local_id=? AND email=?",
+            (
+                phase, last_error, remote_account_id, remote_account_id, time.time(),
+                int(workspace_local_id), (email or "").strip().lower(),
+            ),
+        )
+        con.commit()
+        return cur.rowcount > 0
 
 
 def delete_registered(email: str) -> bool:

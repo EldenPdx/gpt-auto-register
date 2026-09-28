@@ -45,6 +45,24 @@ python start_webui.py
 # 浏览器自动打开 http://127.0.0.1:8765/
 ```
 
+#### Docker Compose 部署（支持热更新）
+
+```bash
+docker compose up --build
+```
+
+启动后访问 <http://127.0.0.1:8765/>。当前目录会挂载到容器内，修改 Python
+源码会触发 Uvicorn 自动重载；修改 `webui/static/` 下的静态文件后刷新浏览器即可看到变化。
+SQLite 数据保存在宿主机的 `webui/webui.db`，重建容器不会清空数据。
+
+后台运行与停止：
+
+```bash
+docker compose up --build -d
+docker compose logs -f
+docker compose down
+```
+
 **公网启动**：
 ```bash
 python start_webui.py --host 0.0.0.0 --port 8765

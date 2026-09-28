@@ -50,7 +50,7 @@ _IOS_SAFARI_VERSIONS = [
         "ios_versions": ["18_0", "18_1", "18_1_1"],
     },
     {
-        "impersonate": "safari18_4_ios",
+        "impersonate": "safari184_ios",
         "safari_ver": "18.4",
         "webkit_ver": "605.1.15",
         "ios_versions": ["18_4", "18_4_1"],

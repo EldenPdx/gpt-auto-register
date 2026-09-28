@@ -12,6 +12,12 @@ const routes = [
     meta: { title: '仪表盘', icon: 'Odometer', group: '概览' },
   },
   {
+    path: '/team',
+    name: 'team-workspaces',
+    component: () => import('@/views/TeamWorkspaces.vue'),
+    meta: { title: 'Team 工作空间', group: 'Team', icon: 'User' },
+  },
+  {
     path: '/import',
     name: 'import',
     component: () => import('@/views/Import.vue'),

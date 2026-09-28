@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import logging
+import os
+import sqlite3
 import sys
 import time
 import uuid
@@ -25,7 +28,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, export_formats, registrar  # noqa: E402
+from . import db, export_formats, registrar, team  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
 from mail_providers import (  # noqa: E402
@@ -57,6 +60,31 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
 
 
+@app.middleware("http")
+async def restrict_team_api(request: Request, call_next):
+    """Keep destructive Team operations local unless remote access is explicit."""
+    if request.url.path.startswith("/api/team/"):
+        host = request.client.host if request.client else ""
+        request_host = (request.headers.get("host") or "").split(":", 1)[0].strip("[]")
+        allow_remote = os.getenv("TEAM_ALLOW_REMOTE", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        try:
+            is_loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            is_loopback = host == "testclient"
+        try:
+            is_loopback_host = ipaddress.ip_address(request_host).is_loopback
+        except ValueError:
+            is_loopback_host = request_host.lower() == "localhost"
+        if not (is_loopback or is_loopback_host) and not allow_remote:
+            return JSONResponse(
+                status_code=403,
+                content={"ok": False, "detail": "Team API 默认仅允许本机访问"},
+            )
+    return await call_next(request)
+
+
 # ──────────────────────── Pydantic 模型 ────────────────────────
 
 
@@ -84,12 +112,453 @@ class RegisterReq(BaseModel):
     want_2fa: bool = False
 
 
+class TeamWorkspaceReq(BaseModel):
+    id: Optional[int] = None
+    name: str
+    workspace_id: str
+    owner_email: str = ""
+    owner_access_token: Optional[str] = None
+    owner_session_token: Optional[str] = None
+    owner_device_id: Optional[str] = None
+    proxy: Optional[str] = None
+    client_build_number: Optional[str] = None
+    client_version: Optional[str] = None
+    sub2api_url: Optional[str] = None
+    sub2api_api_key: Optional[str] = None
+    sub2api_group_ids: Optional[str] = None
+    sub2api_timeout: Optional[int] = Field(default=None, ge=1, le=600)
+    import_owner_credentials: bool = False
+
+
+class TeamEmailsReq(BaseModel):
+    emails: list[str] = Field(default_factory=list)
+
+
+class TeamPushAccountReq(BaseModel):
+    email: str
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    id_token: Optional[str] = None
+
+
+class TeamPushMembersReq(BaseModel):
+    emails: list[str] = Field(default_factory=list)
+    accounts: list[TeamPushAccountReq] = Field(default_factory=list)
+
+
+class TeamInviteEmailReq(BaseModel):
+    email: str
+
+
+class TeamAcceptRequestReq(BaseModel):
+    accept_request: bool = True
+
+
+class TeamOffboardReq(BaseModel):
+    accounts: list[dict] = Field(default_factory=list)
+
+
 # ──────────────────────── API ────────────────────────
 
 
 @app.get("/api/health")
 def health():
     return {"ok": True, "stats": db.stats()}
+
+
+def _public_team_workspace(item: dict) -> dict:
+    out = dict(item)
+    for key in ("owner_access_token", "owner_session_token", "proxy", "sub2api_api_key"):
+        out[key] = "***" if out.get(key) else ""
+    return out
+
+
+def _team_workspace_or_404(local_id: int) -> dict:
+    workspace = db.get_team_workspace(local_id)
+    if not workspace:
+        raise HTTPException(404, "Team 工作空间不存在")
+    return workspace
+
+
+def _team_error(exc: Exception):
+    if isinstance(exc, team.TeamServiceError):
+        status = exc.status_code if exc.status_code in (409, 429) else 502
+        raise HTTPException(status, _safe_team_result(exc.to_dict()))
+    if isinstance(exc, ValueError):
+        raise HTTPException(400, str(exc))
+    raise HTTPException(500, str(exc))
+
+
+def _safe_team_result(value):
+    """Remove credentials and live session objects before returning service results."""
+    if isinstance(value, list):
+        return [_safe_team_result(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    out = {}
+    for key, item in value.items():
+        lowered = str(key).lower()
+        compact = lowered.replace("_", "").replace("-", "")
+        if lowered in {"_session", "raw", "identity", "whoami", "trace"}:
+            continue
+        if lowered == "credentials" or any(marker in compact for marker in (
+            "token", "password", "totpsecret", "apikey", "cookie",
+        )):
+            out[key] = "***" if item else ""
+        else:
+            out[key] = _safe_team_result(item)
+    return out
+
+
+def _public_team_usage(usage):
+    if not isinstance(usage, dict):
+        return usage
+    allowed = {
+        "status", "error_code", "reason", "quota_window", "reset_after_seconds",
+        "pct_5h", "pct_7d", "pct_unknown", "reset_5h", "reset_7d",
+        "limit_reached", "allowed", "overage_reached", "spend_reached",
+        "short_window_limited", "window_seconds", "region", "threshold",
+        "agent_assertion",
+    }
+    return {key: usage.get(key) for key in allowed if key in usage}
+
+
+def _team_batch_response(result: dict) -> dict:
+    safe = _safe_team_result(result)
+    rows = safe.get("results") if isinstance(safe, dict) else []
+    return {"ok": all(row.get("ok") is True for row in (rows or [])), **safe}
+
+
+def _team_account_specs(local_id: int, emails: list[str]) -> list[dict]:
+    specs = []
+    for email in emails:
+        binding = db.get_or_create_team_binding(local_id, email)
+        specs.append({
+            "email": binding["email"],
+            "binding_id": binding["binding_id"],
+            "generation": binding["generation"],
+            "request_id": binding["request_id"],
+        })
+    return specs
+
+
+def _record_team_batch(local_id: int, result: dict) -> None:
+    for row in result.get("results") or []:
+        email = row.get("email") or ""
+        if not email:
+            continue
+        remote = row.get("delivery", {}).get("account", {}) if row.get("ok") else {}
+        error_detail = (row.get("error") or {}).get("detail") if isinstance(row.get("error"), dict) else {}
+        failed_remote_id = (
+            error_detail.get("remote_account_id")
+            if isinstance(error_detail, dict) else ""
+        )
+        db.update_team_binding(
+            local_id,
+            email,
+            phase="complete" if row.get("ok") else "failed",
+            last_error="" if row.get("ok") else str(row.get("error") or "")[:2000],
+            remote_account_id=str(
+                remote.get("id") or remote.get("account_id") or failed_remote_id or ""
+            ),
+        )
+
+
+@app.get("/api/team/workspaces")
+def api_team_workspaces():
+    return {
+        "ok": True,
+        "items": [_public_team_workspace(item) for item in db.list_team_workspaces()],
+    }
+
+
+@app.post("/api/team/workspaces")
+def api_save_team_workspace(req: TeamWorkspaceReq):
+    data = req.model_dump(exclude_unset=True)
+    data["name"] = req.name.strip()
+    data["workspace_id"] = req.workspace_id.strip()
+    data["owner_email"] = req.owner_email.strip().lower()
+    if not data["name"] or not data["workspace_id"]:
+        raise HTTPException(400, "工作空间名称和 workspace_id 不能为空")
+    if req.id and not db.get_team_workspace(req.id):
+        raise HTTPException(404, "Team 工作空间不存在")
+    if not req.id and any(
+        item["workspace_id"] == data["workspace_id"]
+        for item in db.list_team_workspaces()
+    ):
+        raise HTTPException(409, "workspace_id 已存在")
+
+    for key in ("owner_access_token", "owner_session_token", "proxy", "sub2api_api_key"):
+        if data.get(key) == "***":
+            data.pop(key)
+
+    if req.import_owner_credentials:
+        owner = db.get_registered(data["owner_email"])
+        if not owner:
+            raise HTTPException(404, "未找到母号的本地注册凭据")
+        imported_at = owner.get("access_token") or ""
+        imported_auth = _get_auth(_decode_jwt_payload(imported_at))
+        imported_workspace_id = str(
+            imported_auth.get("chatgpt_account_id")
+            or imported_auth.get("account_id")
+            or ""
+        ).strip()
+        if imported_workspace_id == data["workspace_id"]:
+            data["owner_access_token"] = imported_at
+        elif imported_at:
+            raise HTTPException(400, "母号 access_token 不属于目标 workspace_id")
+        data.update({
+            "owner_session_token": owner.get("session_token") or "",
+            "owner_device_id": owner.get("device_id") or data.get("owner_device_id") or "",
+        })
+    data.pop("import_owner_credentials", None)
+    try:
+        saved = db.save_team_workspace(data)
+    except sqlite3.IntegrityError as e:
+        raise HTTPException(409, f"workspace_id 已存在: {e}")
+    except (TypeError, ValueError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "data": _public_team_workspace(saved)}
+
+
+@app.get("/api/team/workspaces/{local_id}")
+def api_team_workspace(local_id: int):
+    item = db.get_team_workspace(local_id)
+    if not item:
+        raise HTTPException(404, "Team 工作空间不存在")
+    return {"ok": True, "data": _public_team_workspace(item)}
+
+
+@app.delete("/api/team/workspaces/{local_id}")
+def api_delete_team_workspace(local_id: int):
+    if not db.delete_team_workspace(local_id):
+        raise HTTPException(404, "Team 工作空间不存在")
+    return {"ok": True}
+
+
+@app.get("/api/team/workspaces/{local_id}/accounts")
+def api_team_accounts(local_id: int):
+    workspace = _team_workspace_or_404(local_id)
+    items = []
+    for row in db.list_registered_full():
+        extra = row.get("extra") if isinstance(row.get("extra"), dict) else {}
+        team_usage = extra.get("team_usage") if isinstance(extra.get("team_usage"), dict) else {}
+        items.append({
+            "email": row.get("email"),
+            "has_password": bool(row.get("password")),
+            "has_totp_secret": bool(row.get("totp_secret")),
+            "has_access_token": bool(row.get("access_token")),
+            "has_refresh_token": bool(row.get("refresh_token")),
+            "has_id_token": bool(row.get("id_token")),
+            "created_at": row.get("created_at"),
+            "usage": _public_team_usage(team_usage.get(workspace["workspace_id"])),
+        })
+    return {"ok": True, "items": items}
+
+
+@app.get("/api/team/workspaces/{local_id}/members")
+def api_team_members(local_id: int):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        result = team.TeamClient(workspace).list_members()
+    except Exception as exc:
+        _team_error(exc)
+    return {"ok": True, "items": result["members"], **{
+        key: result[key] for key in ("total", "coverage")
+    }}
+
+
+@app.get("/api/team/workspaces/{local_id}/invites")
+def api_team_invites(local_id: int):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        client = team.TeamClient(workspace)
+        sent = client.list_invites()
+        requests = client.list_invites(include_requests=True)
+    except Exception as exc:
+        _team_error(exc)
+    items = [dict(item, kind=item.get("kind") or "invite") for item in sent["items"]]
+    items.extend(
+        dict(item, kind=item.get("kind") or "request", is_request=True)
+        for item in requests["items"]
+    )
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@app.get("/api/team/workspaces/{local_id}/snapshot")
+def api_team_snapshot(local_id: int):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        snapshot = team.TeamClient(workspace).snapshot()
+    except Exception as exc:
+        _team_error(exc)
+    snapshot["member_count"] = snapshot.get("members", {}).get("total", 0)
+    return {"ok": True, "snapshot": _safe_team_result(snapshot)}
+
+
+@app.post("/api/team/workspaces/{local_id}/invites")
+def api_team_send_invites(local_id: int, req: TeamEmailsReq):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        result = team.TeamClient(workspace).send_invites(req.emails)
+    except Exception as exc:
+        _team_error(exc)
+    rows = []
+    for item in result["account_invites"]:
+        row = item if isinstance(item, dict) else {"email": str(item)}
+        rows.append({**row, "ok": True})
+    for item in result["errored_emails"]:
+        row = item if isinstance(item, dict) else {"email": str(item)}
+        rows.append({**row, "ok": False})
+    return {"ok": not result["errored_emails"], "results": rows, **_safe_team_result(result)}
+
+
+@app.delete("/api/team/workspaces/{local_id}/invites")
+def api_team_delete_invite(local_id: int, req: TeamInviteEmailReq):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        result = team.TeamClient(workspace).delete_invite(req.email)
+    except Exception as exc:
+        _team_error(exc)
+    return {"ok": True, "results": [{"email": req.email, "ok": True}], "data": result}
+
+
+@app.patch("/api/team/workspaces/{local_id}/invites/{invite_id}")
+def api_team_accept_request(local_id: int, invite_id: str, req: TeamAcceptRequestReq):
+    if not req.accept_request:
+        raise HTTPException(400, "accept_request 必须为 true")
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        result = team.TeamClient(workspace).accept_join_request(invite_id)
+    except Exception as exc:
+        _team_error(exc)
+    return {"ok": True, "data": result}
+
+
+@app.post("/api/team/workspaces/{local_id}/auto_join")
+def api_team_auto_join(local_id: int, req: TeamEmailsReq):
+    workspace = _team_workspace_or_404(local_id)
+    if not req.emails:
+        raise HTTPException(400, "至少选择一个账号")
+    result = team.auto_join_accounts(workspace, _team_account_specs(local_id, req.emails))
+    _record_team_batch(local_id, result)
+    return _team_batch_response(result)
+
+
+@app.post("/api/team/workspaces/{local_id}/board")
+def api_team_board(local_id: int, req: TeamEmailsReq):
+    workspace = _team_workspace_or_404(local_id)
+    if not req.emails:
+        raise HTTPException(400, "至少选择一个账号")
+    result = team.board_accounts(workspace, _team_account_specs(local_id, req.emails))
+    _record_team_batch(local_id, result)
+    return _team_batch_response(result)
+
+
+@app.post("/api/team/workspaces/{local_id}/members/push-sub2api")
+def api_team_push_members_to_sub2api(local_id: int, req: TeamPushMembersReq):
+    workspace = _team_workspace_or_404(local_id)
+    requested = {
+        item.email.strip().lower(): item.model_dump(exclude_none=True)
+        for item in req.accounts if item.email.strip()
+    }
+    for email in req.emails:
+        cleaned = email.strip().lower()
+        if cleaned:
+            requested.setdefault(cleaned, {"email": cleaned})
+    if not requested:
+        raise HTTPException(400, "至少选择一个成员")
+    specs = _team_account_specs(local_id, list(requested))
+    for spec in specs:
+        supplied = requested[spec["email"]]
+        credentials = {
+            key: str(supplied.get(key) or "").strip()
+            for key in ("access_token", "refresh_token", "id_token")
+        }
+        if any(credentials.values()):
+            spec["credentials"] = credentials
+    result = team.push_members_to_sub2api(workspace, specs)
+    _record_team_batch(local_id, result)
+    return _team_batch_response(result)
+
+
+@app.post("/api/team/workspaces/{local_id}/offboard")
+def api_team_offboard(local_id: int, req: TeamOffboardReq):
+    workspace = _team_workspace_or_404(local_id)
+    if not req.accounts:
+        raise HTTPException(400, "至少选择一个成员")
+    return _team_batch_response(team.offboard_accounts(workspace, req.accounts))
+
+
+@app.post("/api/team/workspaces/{local_id}/accounts/{email}/oauth")
+def api_team_account_oauth(local_id: int, email: str):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        result = team.account_oauth(workspace, email)
+    except Exception as exc:
+        _team_error(exc)
+    if email.strip().lower() == str(workspace.get("owner_email") or "").lower():
+        credentials = result.get("credentials") or {}
+        db.save_team_workspace({
+            "id": local_id,
+            "workspace_id": workspace["workspace_id"],
+            "owner_access_token": result.get("workspace_access_token") or None,
+            "owner_session_token": credentials.get("session_token") or None,
+            "owner_device_id": credentials.get("device_id") or None,
+        })
+    return _safe_team_result(result)
+
+
+@app.post("/api/team/workspaces/{local_id}/accounts/{email}/usage")
+def api_team_account_usage(local_id: int, email: str):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        oauth = team.account_oauth(workspace, email)
+        result = team.TeamClient(
+            workspace, session=oauth["_session"],
+        ).probe_usage(oauth["workspace_access_token"], policy="inventory")
+    except Exception as exc:
+        _team_error(exc)
+    db.update_team_usage(email, workspace["workspace_id"], result)
+    public_usage = _public_team_usage(result)
+    return {"ok": True, "email": email, "results": [{
+        "email": email, "ok": result.get("status") not in ("auth_error", "forbidden"),
+        "status": result.get("status"), "usage": public_usage,
+    }]}
+
+
+@app.get("/api/team/workspaces/{local_id}/sub2api/groups")
+def api_team_sub2api_groups(local_id: int):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        return {"ok": True, **_safe_team_result(team.Sub2ApiClient(workspace).groups())}
+    except Exception as exc:
+        _team_error(exc)
+
+
+@app.post("/api/team/workspaces/{local_id}/sub2api/reuse-export-config")
+def api_team_reuse_export_sub2api(local_id: int):
+    workspace = _team_workspace_or_404(local_id)
+    config = db.get_export_internal_config()["sub2api"]
+    if not config.get("sub2api_url") or not config.get("sub2api_api_key"):
+        raise HTTPException(400, "自动导出的 Sub2API BaseURL 或 API Key 尚未配置")
+    saved = db.save_team_workspace({
+        "id": local_id,
+        "workspace_id": workspace["workspace_id"],
+        "sub2api_url": config["sub2api_url"],
+        "sub2api_api_key": config["sub2api_api_key"],
+    })
+    return {"ok": True, "data": _public_team_workspace(saved)}
+
+
+@app.post("/api/team/workspaces/{local_id}/sub2api/test")
+def api_team_sub2api_test(local_id: int):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        groups = team.Sub2ApiClient(workspace).groups()
+    except Exception as exc:
+        _team_error(exc)
+    return {"ok": True, "message": "Sub2API 配置可用", **_safe_team_result(groups)}
 
 
 @app.post("/api/import")

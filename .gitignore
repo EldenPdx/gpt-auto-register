@@ -46,6 +46,7 @@ htmlcov/
 .tox/
 
 # ──────────────── IDE ────────────────
+.serena/
 .vscode/
 .idea/
 *.swp

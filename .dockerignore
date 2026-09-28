@@ -1,0 +1,15 @@
+.git
+.serena
+.venv
+venv
+__pycache__
+*.py[cod]
+*.log
+.env*
+node_modules
+webui/frontend/node_modules
+webui/webui.db*
+webui/logs
+outputs
+account_*.json
+secrets.json
