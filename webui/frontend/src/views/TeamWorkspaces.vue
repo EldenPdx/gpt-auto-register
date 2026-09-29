@@ -6,6 +6,7 @@ import {
   acceptTeamInvite,
   autoJoinTeam,
   boardTeamAccounts,
+  changeTeamMemberSeat,
   deleteTeamInvite,
   deleteTeamWorkspace,
   getTeamSnapshot,
@@ -22,6 +23,7 @@ import {
   reuseExportSub2apiConfig,
   saveTeamWorkspace,
   sendTeamInvites,
+  submitTeamMemberLoginCredentials,
   testTeamSub2api,
 } from '@/api/team'
 import { updateCredentials } from '@/api/register'
@@ -60,6 +62,7 @@ const selectedWorkspaceId = ref(null)
 const currentWorkspace = ref(null)
 const snapshot = ref({})
 const accounts = ref([])
+const accountsLoaded = ref(false)
 const members = ref([])
 const invites = ref([])
 const sub2apiGroups = ref([])
@@ -85,11 +88,22 @@ const credentialForm = reactive({
   totp_secret: '',
 })
 const remoteOauthDialog = ref(false)
+const seatDialog = ref(false)
+const seatForm = reactive({ workspaceId: null, userId: '', email: '', expected: '', target: '' })
 const remoteOauthForm = reactive({
   email: '',
   access_token: '',
   refresh_token: '',
   id_token: '',
+})
+const remoteLoginDialog = ref(false)
+const remoteLoginForm = reactive({
+  email: '',
+  openai_password: '',
+  totp_secret: '',
+  mailbox_password: '',
+  mail_client_id: '',
+  mail_refresh_token: '',
 })
 
 const inviteEmails = ref('')
@@ -101,6 +115,11 @@ const sub2apiForm = reactive({ url: '', apiKey: '', groupIds: [], timeout: 30 })
 const sub2apiKeySaved = ref(false)
 const currentId = computed(() => currentWorkspace.value?.id || selectedWorkspaceId.value)
 const localEmails = computed(() => new Set(accounts.value.map(emailOf).map((email) => email.toLowerCase())))
+const joinableInviteEmails = computed(() => [...new Set(
+  selectedInvites.value.filter(canAutoJoinInvite).map(emailOf)
+    .map((email) => email.toLowerCase()).filter(Boolean),
+)])
+const hasManualInvites = computed(() => selectedInvites.value.some((row) => !canAutoJoinInvite(row)))
 
 function itemsOf(value) {
   if (Array.isArray(value)) return value
@@ -123,6 +142,21 @@ function userIdOf(row) {
   return row?.id || row?.user_id || ''
 }
 
+const seatOptions = computed(() => {
+  const options = [
+    { value: 'default', label: '标准席位（Standard）' },
+    { value: 'prolite', label: '高级席位（Premium）' },
+  ]
+  if (seatForm.expected === 'usage_based' || members.value.some((row) => row.seat_type === 'usage_based')) {
+    options.push({ value: 'usage_based', label: 'Codex 席位（usage_based）' })
+  }
+  return options
+})
+
+function seatLabel(value) {
+  return seatOptions.value.find((option) => option.value === value)?.label || value || '—'
+}
+
 function canAutoJoinInvite(row) {
   return localEmails.value.has(emailOf(row).toLowerCase())
 }
@@ -132,7 +166,7 @@ function sub2apiStatus(row) {
   return {
     ready: { label: 'Sub2API 已推送', type: 'success' },
     missing: { label: 'Sub2API 未推送', type: 'info' },
-    unavailable: { label: 'Sub2API 无法核验', type: 'warning' },
+    unavailable: { label: 'Sub2API 已存在但不可用', type: 'warning' },
     unknown: { label: 'Sub2API 未知', type: 'warning' },
   }[status] || { label: 'Sub2API 未知', type: 'warning' }
 }
@@ -148,7 +182,14 @@ function parseEmails(text) {
 }
 
 function errorText(error) {
-  return error?.data?.detail || error?.data?.message || error?.message || '请求失败'
+  const detail = error?.data?.detail
+  const upstreamErrors = detail?.detail?.detail
+  if (typeof upstreamErrors === 'string') return upstreamErrors
+  if (Array.isArray(upstreamErrors) && upstreamErrors.length) {
+    return upstreamErrors.map((item) => item.msg).filter(Boolean).join('；')
+  }
+  return (typeof detail === 'string' ? detail : detail?.message)
+    || error?.data?.message || error?.message || '请求失败'
 }
 
 async function confirmAction(message, title = '确认操作') {
@@ -228,6 +269,7 @@ function clearDetail() {
   currentWorkspace.value = null
   snapshot.value = {}
   accounts.value = []
+  accountsLoaded.value = false
   members.value = []
   invites.value = []
   sub2apiGroups.value = []
@@ -238,6 +280,7 @@ async function loadDetail() {
   const id = selectedWorkspaceId.value
   if (!id) return clearDetail()
   detailLoading.value = true
+  accountsLoaded.value = false
   selectedAccounts.value = []
   selectedMembers.value = []
   selectedInvites.value = []
@@ -255,6 +298,7 @@ async function loadDetail() {
     snapshot.value = requests[0].status === 'fulfilled'
       ? (requests[0].value?.snapshot || requests[0].value || {}) : {}
     accounts.value = requests[1].status === 'fulfilled' ? itemsOf(requests[1].value) : []
+    accountsLoaded.value = requests[1].status === 'fulfilled'
     members.value = requests[2].status === 'fulfilled' ? itemsOf(requests[2].value) : []
     invites.value = requests[3].status === 'fulfilled' ? itemsOf(requests[3].value) : []
     sub2apiGroups.value = requests[4].status === 'fulfilled'
@@ -275,6 +319,7 @@ async function loadDetail() {
 }
 
 function selectWorkspace(id) {
+  seatDialog.value = false
   selectedWorkspaceId.value = id
   loadDetail()
 }
@@ -367,7 +412,7 @@ async function sendInvites() {
 }
 
 async function autoJoin() {
-  const emails = [...new Set(selectedInvites.value.filter(canAutoJoinInvite).map(emailOf).filter(Boolean))]
+  const emails = joinableInviteEmails.value
   if (!emails.length) return ElMessage.warning('请从邀请列表选择本地账号')
   if (!(await confirmAction(`让 ${emails.length} 个账号自动加入当前工作空间？`, '全自动加入'))) return
   await runOperation('autoJoin', '全自动加入', () => autoJoinTeam(currentId.value, emails))
@@ -402,12 +447,57 @@ function roleOf(row) {
   return 'unknown'
 }
 
+function openSeatDialog(row) {
+  const userId = userIdOf(row)
+  const current = String(row?.seat_type || '')
+  if (!userId || !current) return ElMessage.warning('缺少成员 ID 或当前席位类型')
+  Object.assign(seatForm, {
+    workspaceId: currentId.value, userId, email: emailOf(row), expected: current, target: current,
+  })
+  seatDialog.value = true
+}
+
+async function saveMemberSeat() {
+  if (seatForm.target === seatForm.expected) return ElMessage.info('席位类型未变化')
+  const confirmed = await confirmAction(
+    `将 ${seatForm.email} 的席位由 ${seatLabel(seatForm.expected)} 改为 ${seatLabel(seatForm.target)}？请先在远端核对可用席位及可能产生的费用。`,
+    '确认远端席位调整',
+  )
+  if (!confirmed) return
+  busy.seatChange = true
+  try {
+    await changeTeamMemberSeat(
+      seatForm.workspaceId, seatForm.userId, seatForm.target, seatForm.expected,
+    )
+    ElMessage.success('远端席位已更新并核实')
+  } catch (error) {
+    const message = errorText(error)
+    if (error?.data?.detail?.category === 'verification_incomplete') {
+      ElMessage.warning(`请求结果待核实：${message}`)
+    } else {
+      ElMessage.error(`调整席位失败：${message}`)
+    }
+  } finally {
+    seatDialog.value = false
+    await loadDetail()
+    busy.seatChange = false
+  }
+}
+
 function roleType(row) {
   return { owner: 'danger', admin: 'warning', member: 'info', unknown: 'danger' }[roleOf(row)]
 }
 
 function roleLabel(row) {
   return { owner: '所有者', admin: '管理员', member: '普通成员', unknown: '身份未知' }[roleOf(row)]
+}
+
+function platformPresence(row) {
+  if (row.platform_presence === 'remote_only' || row.platform_presence === 'shared') {
+    return row.platform_presence
+  }
+  if (!accountsLoaded.value || !emailOf(row)) return 'unknown'
+  return localEmails.value.has(emailOf(row).toLowerCase()) ? 'shared' : 'remote_only'
 }
 
 function canOffboard(row) {
@@ -471,6 +561,33 @@ function clearRemoteOauthForm() {
   Object.assign(remoteOauthForm, {
     email: '', access_token: '', refresh_token: '', id_token: '',
   })
+}
+
+function openRemoteLogin(row) {
+  Object.assign(remoteLoginForm, {
+    email: emailOf(row), openai_password: '', totp_secret: '', mailbox_password: '',
+    mail_client_id: '', mail_refresh_token: '',
+  })
+  remoteLoginDialog.value = true
+}
+
+function clearRemoteLoginForm() {
+  for (const field of Object.keys(remoteLoginForm)) remoteLoginForm[field] = ''
+}
+
+async function submitRemoteLogin() {
+  const payload = {
+    ...remoteLoginForm,
+    email: remoteLoginForm.email.trim(),
+    totp_secret: remoteLoginForm.totp_secret.trim(),
+    mail_client_id: remoteLoginForm.mail_client_id.trim(),
+    mail_refresh_token: remoteLoginForm.mail_refresh_token.trim(),
+  }
+  const ok = await runOperation(
+    'remoteLogin', '补充凭据并自动上车',
+    () => submitTeamMemberLoginCredentials(currentId.value, payload), payload.email,
+  )
+  if (ok) remoteLoginDialog.value = false
 }
 
 async function boardSelected() {
@@ -694,10 +811,14 @@ onActivated(() => loadWorkspaces())
             />
             <el-space wrap style="margin: 10px 0 14px">
               <el-button type="primary" :loading="busy.invite" @click="sendInvites">批量发送邀请</el-button>
-              <el-button :loading="busy.autoJoin" @click="autoJoin">
-                全自动加入{{ selectedInvites.length ? ` (${selectedInvites.length})` : '' }}
+              <el-button :disabled="!joinableInviteEmails.length" :loading="busy.autoJoin" @click="autoJoin">
+                全自动加入 ({{ joinableInviteEmails.length }})
               </el-button>
             </el-space>
+            <el-alert
+              v-if="hasManualInvites" type="info" :closable="false" style="margin-bottom: 14px"
+              title="所选非本地邮箱需账号本人接受邀请并提供 OAuth 凭据，无法全自动加入。"
+            />
             <el-table
               :data="invites" size="small" stripe
               @selection-change="(rows) => (selectedInvites = rows)"
@@ -754,14 +875,40 @@ onActivated(() => loadWorkspaces())
               <el-table-column label="邮箱" min-width="220">
                 <template #default="{ row }">{{ emailOf(row) }}</template>
               </el-table-column>
+              <el-table-column label="账号归属" width="120">
+                <template #default="{ row }">
+                  <el-tag v-if="platformPresence(row) === 'shared'" size="small" type="success">双端共有</el-tag>
+                  <el-tag v-else-if="platformPresence(row) === 'remote_only'" size="small" type="info">远端独有</el-tag>
+                  <span v-else>—</span>
+                </template>
+              </el-table-column>
               <el-table-column label="角色" width="110">
                 <template #default="{ row }">
                   <el-tag :type="roleType(row)" size="small">{{ roleLabel(row) }}</el-tag>
                 </template>
               </el-table-column>
-              <el-table-column prop="seat_type" label="席位类型" width="130" />
+              <el-table-column label="席位类型" width="180">
+                <template #default="{ row }">{{ seatLabel(row.seat_type) }}</template>
+              </el-table-column>
               <el-table-column label="user_id" min-width="210" show-overflow-tooltip>
                 <template #default="{ row }"><span class="mono">{{ userIdOf(row) }}</span></template>
+              </el-table-column>
+              <el-table-column label="Sub2API" min-width="160">
+                <template #default="{ row }">
+                  <el-tag :type="sub2apiStatus(row).type" size="small">
+                    {{ sub2apiStatus(row).label }}
+                  </el-tag>
+                </template>
+              </el-table-column>
+              <el-table-column label="操作" width="230" fixed="right">
+                <template #default="{ row }">
+                  <el-button size="small" text type="primary" @click="openSeatDialog(row)">调整席位</el-button>
+                  <el-button
+                    v-if="platformPresence(row) === 'remote_only' || row.login_credentials_supplemented"
+                    size="small" text type="primary"
+                    @click="openRemoteLogin(row)"
+                  >{{ row.login_credentials_supplemented ? '更新登录凭据' : '补充登录凭据' }}</el-button>
+                </template>
               </el-table-column>
               <template #empty><el-empty description="暂无成员" :image-size="60" /></template>
             </el-table>
@@ -898,6 +1045,28 @@ onActivated(() => loadWorkspaces())
       </el-tab-pane>
     </el-tabs>
 
+    <el-dialog v-model="seatDialog" :title="`调整远端席位 · ${seatForm.email}`" width="520px">
+      <el-alert
+        title="将直接修改远端成员席位。平台不核对已购买容量，升级可能产生费用；请先在 OpenAI 工作空间确认可用席位。"
+        type="warning" :closable="false" show-icon style="margin-bottom: 16px"
+      />
+      <el-form label-position="top">
+        <el-form-item label="当前席位">{{ seatLabel(seatForm.expected) }}</el-form-item>
+        <el-form-item label="调整为" required>
+          <el-select v-model="seatForm.target" style="width: 100%">
+            <el-option
+              v-for="option in seatOptions" :key="option.value"
+              :label="option.label" :value="option.value"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="seatDialog = false">取消</el-button>
+        <el-button type="primary" :loading="busy.seatChange" :disabled="seatForm.target === seatForm.expected" @click="saveMemberSeat">应用到远端</el-button>
+      </template>
+    </el-dialog>
+
     <el-dialog
       v-model="workspaceDialog" :title="workspaceForm.id ? '编辑 Team 工作空间' : '新增 Team 工作空间'"
       width="760px" top="5vh"
@@ -1010,6 +1179,37 @@ onActivated(() => loadWorkspaces())
         <el-button type="primary" :loading="busy.remoteOauthPush" @click="pushRemoteMemberWithOauth">
           验证并推送
         </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="remoteLoginDialog" :title="`补充登录凭据 · ${remoteLoginForm.email}`"
+      width="640px" @closed="clearRemoteLoginForm"
+    >
+      <el-alert
+        title="提交后保存凭据并自动 OAuth、上车。已有凭据的字段可留空；首次补充需填写 Outlook Client ID 和邮箱 Refresh Token。"
+        type="info" :closable="false" show-icon style="margin-bottom: 16px"
+      />
+      <el-form label-position="top">
+        <el-form-item label="OpenAI 密码（按账号需要填写）">
+          <el-input v-model="remoteLoginForm.openai_password" type="password" autocomplete="off" />
+        </el-form-item>
+        <el-form-item label="TOTP Secret（按账号需要填写）">
+          <el-input v-model="remoteLoginForm.totp_secret" type="password" autocomplete="off" />
+        </el-form-item>
+        <el-form-item label="Outlook 邮箱密码（选填）">
+          <el-input v-model="remoteLoginForm.mailbox_password" type="password" autocomplete="off" />
+        </el-form-item>
+        <el-form-item label="Outlook Client ID">
+          <el-input v-model="remoteLoginForm.mail_client_id" autocomplete="off" />
+        </el-form-item>
+        <el-form-item label="邮箱 Refresh Token">
+          <el-input v-model="remoteLoginForm.mail_refresh_token" type="password" autocomplete="off" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="remoteLoginDialog = false">取消</el-button>
+        <el-button type="primary" :loading="busy.remoteLogin" @click="submitRemoteLogin">保存并自动上车</el-button>
       </template>
     </el-dialog>
   </div>

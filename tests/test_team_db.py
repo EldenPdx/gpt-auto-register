@@ -97,6 +97,51 @@ class TeamWorkspaceDbTest(unittest.TestCase):
         self.assertEqual(retry["generation"], 1)
         self.assertEqual(retry["phase"], "failed")
 
+    def test_refresh_token_rotation_preserves_saved_web_credentials(self) -> None:
+        db.save_registered({
+            "email": "member@example.com", "access_token": "web-at",
+            "refresh_token": "old-rt", "id_token": "old-id", "password": "pw",
+        })
+        self.assertTrue(db.rotate_registered_oauth_tokens(
+            "member@example.com", "old-rt", "new-rt", "new-id",
+        ))
+        self.assertFalse(db.rotate_registered_oauth_tokens(
+            "member@example.com", "old-rt", "stale-rt", "stale-id",
+        ))
+        stored = db.get_registered("member@example.com")
+        self.assertEqual((stored["access_token"], stored["refresh_token"], stored["id_token"]),
+                         ("web-at", "new-rt", "new-id"))
+        self.assertEqual(stored["password"], "pw")
+
+    def test_remote_member_login_credentials_preserve_oauth_tokens_on_update(self) -> None:
+        db.save_team_member_login_credentials(
+            "Member@Example.com", openai_password="openai-pw",
+            totp_secret="JBSWY3DPEHPK3PXP", mailbox_password="mail-pw",
+            mail_client_id="ms-client", mail_refresh_token="m" * 30,
+        )
+        mailbox = db.get_account("member@example.com")
+        self.assertEqual((mailbox["kind"], mailbox["client_id"], mailbox["refresh_token"]),
+                         ("outlook", "ms-client", "m" * 30))
+        registered = db.get_registered("member@example.com")
+        self.assertEqual(registered["password"], "openai-pw")
+        self.assertEqual(registered["totp_secret"], "JBSWY3DPEHPK3PXP")
+        self.assertIn("member@example.com", db.list_team_supplemented_emails())
+
+        db.save_registered({**registered, "access_token": "web-at", "refresh_token": "codex-rt"})
+        db.save_team_member_login_credentials(
+            "member@example.com", openai_password="corrected-pw",
+        )
+        updated = db.get_registered("member@example.com")
+        self.assertEqual((updated["password"], updated["access_token"], updated["refresh_token"]),
+                         ("corrected-pw", "web-at", "codex-rt"))
+        self.assertEqual(db.get_account("member@example.com")["refresh_token"], "m" * 30)
+
+    def test_remote_member_login_rejects_missing_mailbox_before_writing(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Client ID"):
+            db.save_team_member_login_credentials("member@example.com", openai_password="pw")
+        self.assertIsNone(db.get_registered("member@example.com"))
+        self.assertIsNone(db.get_account("member@example.com"))
+
 
 if __name__ == "__main__":
     unittest.main()

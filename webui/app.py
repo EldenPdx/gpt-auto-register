@@ -146,12 +146,26 @@ class TeamPushMembersReq(BaseModel):
     accounts: list[TeamPushAccountReq] = Field(default_factory=list)
 
 
+class TeamMemberLoginReq(BaseModel):
+    email: str = Field(..., max_length=320)
+    openai_password: str = Field("", max_length=1024)
+    totp_secret: str = Field("", max_length=1024)
+    mailbox_password: str = Field("", max_length=1024)
+    mail_client_id: str = Field("", max_length=512)
+    mail_refresh_token: str = Field("", max_length=8192)
+
+
 class TeamInviteEmailReq(BaseModel):
     email: str
 
 
 class TeamAcceptRequestReq(BaseModel):
     accept_request: bool = True
+
+
+class TeamSeatChangeReq(BaseModel):
+    seat_type: str
+    expected_seat_type: str
 
 
 class TeamOffboardReq(BaseModel):
@@ -182,7 +196,7 @@ def _team_workspace_or_404(local_id: int) -> dict:
 
 def _team_error(exc: Exception):
     if isinstance(exc, team.TeamServiceError):
-        status = exc.status_code if exc.status_code in (409, 429) else 502
+        status = exc.status_code if exc.status_code in (403, 409, 422, 429) else 502
         raise HTTPException(status, _safe_team_result(exc.to_dict()))
     if isinstance(exc, ValueError):
         raise HTTPException(400, str(exc))
@@ -363,9 +377,46 @@ def api_team_members(local_id: int):
         result = team.TeamClient(workspace).list_members()
     except Exception as exc:
         _team_error(exc)
-    return {"ok": True, "items": result["members"], **{
+    bindings = db.list_team_bindings(local_id)
+    local_emails = db.list_registered_emails()
+    supplemented_emails = db.list_team_supplemented_emails()
+    statuses = {}
+    if workspace.get("sub2api_url") and workspace.get("sub2api_api_key"):
+        try:
+            sub2api = team.Sub2ApiClient(workspace)
+            accounts = sub2api.list_accounts()
+        except Exception:
+            accounts = None
+        if accounts is not None:
+            for member in result["members"]:
+                email = team._member_email(member)
+                try:
+                    statuses[email] = sub2api.member_status(
+                        sub2api.member_account(accounts, email, bindings.get(email))
+                    )
+                except Exception:
+                    statuses[email] = {"status": "unknown"}
+    items = [dict(
+        member,
+        platform_presence="shared" if team._member_email(member) in local_emails else "remote_only",
+        login_credentials_supplemented=team._member_email(member) in supplemented_emails,
+        sub2api=statuses.get(team._member_email(member), {"status": "unknown"}),
+    ) for member in result["members"]]
+    return {"ok": True, "items": _safe_team_result(items), **{
         key: result[key] for key in ("total", "coverage")
     }}
+
+
+@app.patch("/api/team/workspaces/{local_id}/members/{user_id}/seat")
+def api_team_change_member_seat(local_id: int, user_id: str, req: TeamSeatChangeReq):
+    workspace = _team_workspace_or_404(local_id)
+    try:
+        result = team.TeamClient(workspace).change_member_seat(
+            user_id, req.seat_type, req.expected_seat_type,
+        )
+    except Exception as exc:
+        _team_error(exc)
+    return {"ok": True, **_safe_team_result(result)}
 
 
 @app.get("/api/team/workspaces/{local_id}/invites")
@@ -482,12 +533,54 @@ def api_team_push_members_to_sub2api(local_id: int, req: TeamPushMembersReq):
     return _team_batch_response(result)
 
 
+@app.post("/api/team/workspaces/{local_id}/members/login-credentials")
+def api_team_member_login_credentials(local_id: int, req: TeamMemberLoginReq):
+    workspace = _team_workspace_or_404(local_id)
+    email = req.email.strip().lower()
+    if not email:
+        raise HTTPException(400, "email 不能为空")
+    try:
+        snapshot = team.TeamClient(workspace).list_members()
+    except Exception as exc:
+        _team_error(exc)
+    if snapshot["coverage"] < 1:
+        raise HTTPException(409, "成员快照不完整，请刷新后重试")
+    if not any(team._member_email(member) == email for member in snapshot["members"]):
+        raise HTTPException(404, "该邮箱不是当前工作空间成员")
+    try:
+        db.save_team_member_login_credentials(
+            email,
+            openai_password=req.openai_password,
+            totp_secret=req.totp_secret,
+            mailbox_password=req.mailbox_password,
+            mail_client_id=req.mail_client_id,
+            mail_refresh_token=req.mail_refresh_token,
+        )
+    except Exception as exc:
+        _team_error(exc)
+    result = team.board_accounts(workspace, _team_account_specs(local_id, [email]))
+    _record_team_batch(local_id, result)
+    return _team_batch_response(result)
+
+
 @app.post("/api/team/workspaces/{local_id}/offboard")
 def api_team_offboard(local_id: int, req: TeamOffboardReq):
     workspace = _team_workspace_or_404(local_id)
     if not req.accounts:
         raise HTTPException(400, "至少选择一个成员")
-    return _team_batch_response(team.offboard_accounts(workspace, req.accounts))
+    bindings = db.list_team_bindings(local_id)
+    specs = []
+    for account in req.accounts:
+        spec = dict(account)
+        email = str(spec.get("email") or "").strip().lower()
+        if email and email in bindings:
+            spec["binding"] = bindings[email]
+        specs.append(spec)
+    result = team.offboard_accounts(workspace, specs)
+    for row in result.get("results") or []:
+        if row.get("ok") and row.get("email"):
+            db.update_team_binding(local_id, row["email"], phase="offboarded", clear_remote=True)
+    return _team_batch_response(result)
 
 
 @app.post("/api/team/workspaces/{local_id}/accounts/{email}/oauth")

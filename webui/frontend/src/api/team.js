@@ -11,6 +11,11 @@ export const deleteTeamWorkspace = (id) => http.delete(base(id))
 
 export const listTeamAccounts = (id) => http.get(`${base(id)}/accounts`, LONG_REQUEST)
 export const listTeamMembers = (id) => http.get(`${base(id)}/members`, LONG_REQUEST)
+export const changeTeamMemberSeat = (id, userId, seatType, expectedSeatType) =>
+  http.patch(`${base(id)}/members/${part(userId)}/seat`, {
+    seat_type: seatType,
+    expected_seat_type: expectedSeatType,
+  }, LONG_REQUEST)
 export const listTeamInvites = (id) => http.get(`${base(id)}/invites`, LONG_REQUEST)
 export const getTeamSnapshot = (id) => http.get(`${base(id)}/snapshot`, LONG_REQUEST)
 export const listSub2apiGroups = (id) => http.get(`${base(id)}/sub2api/groups`, LONG_REQUEST)
@@ -34,6 +39,8 @@ export const boardTeamAccounts = (id, emails) =>
   http.post(`${base(id)}/board`, { emails }, LONG_REQUEST)
 export const pushTeamMembersToSub2api = (id, accounts) =>
   http.post(`${base(id)}/members/push-sub2api`, { accounts }, LONG_REQUEST)
+export const submitTeamMemberLoginCredentials = (id, credentials) =>
+  http.post(`${base(id)}/members/login-credentials`, credentials, LONG_REQUEST)
 export const offboardTeamAccounts = (id, accounts) =>
   http.post(`${base(id)}/offboard`, { accounts }, LONG_REQUEST)
 export const testTeamSub2api = (id) =>

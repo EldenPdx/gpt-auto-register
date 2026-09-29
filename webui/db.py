@@ -943,6 +943,82 @@ def get_registered(email: str) -> Optional[dict]:
     return out
 
 
+def list_registered_emails() -> set[str]:
+    return {row["email"] for row in _conn().execute("SELECT email FROM registered")}
+
+
+def list_team_supplemented_emails() -> set[str]:
+    rows = _conn().execute("SELECT email, extra_json FROM registered WHERE extra_json IS NOT NULL")
+    emails = set()
+    for row in rows:
+        try:
+            extra = json.loads(row["extra_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(extra, dict) and extra.get("team_login_credentials") is True:
+            emails.add(row["email"])
+    return emails
+
+
+def save_team_member_login_credentials(email: str, *, openai_password: str = "",
+                                       totp_secret: str = "", mailbox_password: str = "",
+                                       mail_client_id: str = "",
+                                       mail_refresh_token: str = "") -> None:
+    """Store an Outlook member's login and mailbox credentials without replacing OAuth tokens."""
+    email = (email or "").strip().lower()
+    if not email:
+        raise ValueError("email is required")
+    totp_secret = normalize_totp_secret(totp_secret) if totp_secret else ""
+    mail_client_id = (mail_client_id or "").strip()
+    mail_refresh_token = (mail_refresh_token or "").strip()
+    with _lock:
+        con = _conn()
+        mailbox = con.execute(
+            "SELECT kind, client_id, refresh_token FROM outlook_accounts WHERE email=?",
+            (email,),
+        ).fetchone()
+        if mailbox and mailbox["kind"] != "outlook":
+            raise ValueError("该邮箱的现有邮件来源不是 Outlook，不能覆盖其凭据")
+        client_id = mail_client_id or (mailbox["client_id"] if mailbox else "")
+        refresh_token = mail_refresh_token or (mailbox["refresh_token"] if mailbox else "")
+        if not client_id or len(refresh_token) < 20:
+            raise ValueError("首次补充需提供 Outlook Client ID 和有效的邮箱 Refresh Token")
+        now = time.time()
+        con.execute(
+            "INSERT INTO outlook_accounts "
+            "(email, password, client_id, refresh_token, kind, status, imported_at) "
+            "VALUES (?, ?, ?, ?, 'outlook', 'available', ?) "
+            "ON CONFLICT(email) DO UPDATE SET "
+            "password=CASE WHEN excluded.password != '' THEN excluded.password ELSE outlook_accounts.password END, "
+            "client_id=excluded.client_id, refresh_token=excluded.refresh_token",
+            (email, mailbox_password, client_id, refresh_token, now),
+        )
+        con.execute(
+            "INSERT INTO registered (email, password, totp_secret, extra_json, created_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(email) DO UPDATE SET "
+            "password=CASE WHEN excluded.password != '' THEN excluded.password ELSE registered.password END, "
+            "totp_secret=CASE WHEN excluded.totp_secret != '' THEN excluded.totp_secret ELSE registered.totp_secret END",
+            (email, openai_password, totp_secret,
+             json.dumps({"mail_source": "outlook", "team_login_credentials": True}), now),
+        )
+        con.commit()
+
+
+def rotate_registered_oauth_tokens(email: str, old_refresh_token: str,
+                                   refresh_token: str, id_token: str) -> bool:
+    with _lock:
+        con = _conn()
+        cur = con.execute(
+            "UPDATE registered SET refresh_token=?, "
+            "id_token=CASE WHEN ? != '' THEN ? ELSE id_token END "
+            "WHERE email=? AND refresh_token=?",
+            (refresh_token, id_token, id_token, email.lower(), old_refresh_token),
+        )
+        con.commit()
+        return cur.rowcount > 0
+
+
 # ──────────────────────── Team 工作空间 ────────────────────────
 
 
@@ -1073,16 +1149,25 @@ def get_or_create_team_binding(workspace_local_id: int, email: str) -> dict:
         return dict(row)
 
 
+def list_team_bindings(workspace_local_id: int) -> dict[str, dict]:
+    rows = _conn().execute(
+        "SELECT * FROM team_account_bindings WHERE workspace_local_id=?",
+        (int(workspace_local_id),),
+    ).fetchall()
+    return {row["email"]: dict(row) for row in rows}
+
+
 def update_team_binding(workspace_local_id: int, email: str, *, phase: str,
-                        last_error: str = "", remote_account_id: str = "") -> bool:
+                        last_error: str = "", remote_account_id: str = "",
+                        clear_remote: bool = False) -> bool:
     with _lock:
         con = _conn()
         cur = con.execute(
             "UPDATE team_account_bindings SET phase=?, last_error=?, "
-            "remote_account_id=CASE WHEN ? != '' THEN ? ELSE remote_account_id END, "
+            "remote_account_id=CASE WHEN ? THEN '' WHEN ? != '' THEN ? ELSE remote_account_id END, "
             "updated_at=? WHERE workspace_local_id=? AND email=?",
             (
-                phase, last_error, remote_account_id, remote_account_id, time.time(),
+                phase, last_error, clear_remote, remote_account_id, remote_account_id, time.time(),
                 int(workspace_local_id), (email or "").strip().lower(),
             ),
         )

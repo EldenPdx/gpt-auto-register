@@ -3623,6 +3623,10 @@ class AuthFlow:
                         (continue_url or "")[:180] or "(empty)",
                     )
             except Exception as e:
+                if "invalid_state" in str(e).lower():
+                    # The authorize session is gone; signup in this same session
+                    # only repeats the 409 and hides the original login failure.
+                    raise
                 logger.warning(f"login screen_hint 探测失败，回退 signup 探测: {e}")
                 continue_url = ""
                 page_type = ""

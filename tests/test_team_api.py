@@ -137,6 +137,117 @@ class TeamWorkspaceApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["items"][0]["email"], "member@example.com")
         self.assertEqual(response.json()["coverage"], 1.0)
+        self.assertEqual(response.json()["items"][0]["sub2api"]["status"], "unknown")
+
+    def test_members_route_uses_remote_readback_for_sub2api_status(self) -> None:
+        workspace = db.save_team_workspace({
+            "name": "Alpha", "workspace_id": "ws-alpha", "owner_access_token": "owner-token",
+            "sub2api_url": "https://sub2.example", "sub2api_api_key": "key",
+            "sub2api_group_ids": "7",
+        })
+        member = {"id": "u1", "email": "member@example.com", "role": "member"}
+        remote = Mock()
+        remote.list_members.return_value = {"members": [member], "total": 1, "coverage": 1.0}
+        sub2api = Mock()
+        sub2api.list_accounts.return_value = [{"id": 42}]
+        sub2api.member_account.return_value = {"id": 42}
+        sub2api.member_status.return_value = {"status": "ready", "account_id": "42"}
+        with (
+            patch("webui.app.team.TeamClient", return_value=remote),
+            patch("webui.app.team.Sub2ApiClient", return_value=sub2api),
+        ):
+            response = self.client.get(f"/api/team/workspaces/{workspace['id']}/members")
+        self.assertEqual(response.json()["items"][0]["sub2api"], {
+            "status": "ready", "account_id": "42",
+        })
+
+    def test_member_seat_route_passes_expected_type_and_returns_verified_member(self) -> None:
+        workspace = db.save_team_workspace({
+            "name": "Alpha", "workspace_id": "ws-alpha", "owner_access_token": "owner-token",
+        })
+        remote = Mock()
+        remote.change_member_seat.return_value = {
+            "changed": True, "member": {"id": "u1", "seat_type": "prolite"},
+        }
+        with patch("webui.app.team.TeamClient", return_value=remote):
+            response = self.client.patch(
+                f"/api/team/workspaces/{workspace['id']}/members/u1/seat",
+                json={"seat_type": "Premium", "expected_seat_type": "default"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["member"]["seat_type"], "prolite")
+        remote.change_member_seat.assert_called_once_with("u1", "Premium", "default")
+
+    def test_member_seat_route_preserves_upstream_paid_seat_rejection(self) -> None:
+        from webui.team import TeamServiceError
+
+        workspace = db.save_team_workspace({
+            "name": "Alpha", "workspace_id": "ws-alpha", "owner_access_token": "owner-token",
+        })
+        remote = Mock()
+        remote.change_member_seat.side_effect = TeamServiceError(
+            "Team upstream HTTP 403", category="forbidden", status_code=403,
+            detail={"detail": "Unable to update paid workspace seat."},
+        )
+        with patch("webui.app.team.TeamClient", return_value=remote):
+            response = self.client.patch(
+                f"/api/team/workspaces/{workspace['id']}/members/u1/seat",
+                json={"seat_type": "Standard", "expected_seat_type": "prolite"},
+            )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            response.json()["detail"]["detail"]["detail"],
+            "Unable to update paid workspace seat.",
+        )
+
+    def test_remote_member_credentials_are_saved_then_boarded_without_exposing_secrets(self) -> None:
+        workspace = db.save_team_workspace({
+            "name": "Alpha", "workspace_id": "ws-alpha", "owner_access_token": "owner-token",
+        })
+        remote = Mock()
+        remote.list_members.return_value = {
+            "members": [{"id": "u1", "email": "member@example.com", "role": "member"}],
+            "total": 1, "coverage": 1.0,
+        }
+        with (
+            patch("webui.app.team.TeamClient", return_value=remote),
+            patch("webui.app.team.board_accounts", return_value={
+                "results": [{"email": "member@example.com", "ok": True,
+                             "delivery": {"account": {"id": 42}}}],
+            }) as board,
+        ):
+            response = self.client.post(
+                f"/api/team/workspaces/{workspace['id']}/members/login-credentials",
+                json={"email": "member@example.com", "openai_password": "openai-secret",
+                      "totp_secret": "JBSWY3DPEHPK3PXP", "mail_client_id": "ms-client",
+                      "mail_refresh_token": "mail-secret-" * 3},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["ok"])
+        self.assertNotIn("openai-secret", response.text)
+        self.assertNotIn("mail-secret", response.text)
+        self.assertEqual(board.call_args.args[1][0]["email"], "member@example.com")
+        self.assertEqual(db.get_registered("member@example.com")["password"], "openai-secret")
+        self.assertEqual(db.get_account("member@example.com")["client_id"], "ms-client")
+        with patch("webui.app.team.TeamClient", return_value=remote):
+            member = self.client.get(
+                f"/api/team/workspaces/{workspace['id']}/members"
+            ).json()["items"][0]
+        self.assertEqual(member["platform_presence"], "shared")
+        self.assertTrue(member["login_credentials_supplemented"])
+
+    def test_remote_member_credentials_reject_nonmember_before_storage(self) -> None:
+        workspace = db.save_team_workspace({"name": "Alpha", "workspace_id": "ws-alpha"})
+        remote = Mock()
+        remote.list_members.return_value = {"members": [], "total": 0, "coverage": 1.0}
+        with patch("webui.app.team.TeamClient", return_value=remote):
+            response = self.client.post(
+                f"/api/team/workspaces/{workspace['id']}/members/login-credentials",
+                json={"email": "absent@example.com", "mail_client_id": "ms-client",
+                      "mail_refresh_token": "m" * 30},
+            )
+        self.assertEqual(response.status_code, 404)
+        self.assertIsNone(db.get_registered("absent@example.com"))
 
     def test_board_route_never_serializes_tokens_from_service_results(self) -> None:
         workspace = db.save_team_workspace({

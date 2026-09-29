@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock
 
 from auth_flow import AuthFlow, AuthResult
 
@@ -26,6 +27,24 @@ class _Session:
 
 
 class TeamOAuthContractTest(unittest.TestCase):
+    def test_invalid_login_state_does_not_retry_signup_in_same_session(self) -> None:
+        flow = AuthFlow.__new__(AuthFlow)
+        flow.result = AuthResult()
+        flow.check_proxy = lambda: True
+        flow.warmup = lambda: True
+        flow.get_csrf_token = lambda: "csrf"
+        flow.get_auth_url = lambda *_args, **_kwargs: "https://auth.openai.com/oauth/authorize"
+        flow.auth_oauth_init = lambda _url: "device"
+        flow.get_sentinel_token = lambda _device: "sentinel"
+        flow._get_env = lambda _key, default="": default
+        flow.authorize_continue = Mock(side_effect=lambda **kwargs: (_ for _ in ()).throw(
+            RuntimeError(f"authorize/continue 失败(screen_hint={kwargs['screen_hint']}): HTTP 409 invalid_state")
+        ))
+
+        with self.assertRaisesRegex(RuntimeError, "screen_hint=login"):
+            flow.run_protocol_login(object(), "member@example.com", "password")
+        self.assertEqual(flow.authorize_continue.call_count, 1)
+
     def test_existing_session_refresh_uses_single_response_and_json_session_token(self) -> None:
         class Cookies:
             def __init__(self):

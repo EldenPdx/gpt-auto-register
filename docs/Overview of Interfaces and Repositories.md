@@ -232,6 +232,16 @@ GET /backend-api/accounts/{workspace_id}/invites
 
 - 响应项：id / invite_id / email_address / role / seat_type / created_time。
 
+### 3.6.1 调整现有成员席位（Web 内部接口）
+
+POST /backend-api/accounts/{workspace_id}/users/{user_id}/seat/update
+
+- body：`{"operation":"switch","seat_type":"default","flow_id":"{uuid}","mutation_attempt_id":"{uuid}"}`；`default` 对应 Standard，`prolite` 对应 Premium。这是当前工作空间成员列表与席位计数返回的原始代码；旧版工作空间可能另有 `usage_based` Codex 席位。
+- 使用工作空间 Owner token；提交前以完整成员快照核对成员 ID 和当前席位，提交后重新读取成员列表，确认目标成员的 `seat_type` 已更新。
+- OpenAI 没有公开受支持的 ChatGPT Business 成员席位管理 API。旧版网页的 PATCH 请求可参照 [2026-06-17 的脱敏抓包](https://github.com/shellus/team-manager/blob/main/docs/dev-spec/chatgpt-backend-api/README.md)；当前付费席位请求已改走 `/seat/update`，旧 PATCH 对付费席位返回 403。当前工作空间读接口确认了 `default` / `prolite` 两类原始值。
+- 当前工作空间的 `/seat/update` 也曾返回 403 `Unable to update paid workspace seat.`；同一成员在 OpenAI 官方成员页操作亦返回 403。遇到该上游拒绝时只展示原始原因并停止重试，不能用旧 PATCH 兜底。
+- 此端点可能变化；切换席位可能触发远端购买或延迟生效，平台不以本地席位数代替远端计费确认。
+
 ### 3.7 退出 / 踢人
 
 DELETE /backend-api/accounts/{workspace_id}/users/{user_id}
@@ -419,6 +429,7 @@ GET https://chatgpt.com/cdn-cgi/trace
 | OAuth：工作区 / 多账号选择 | workspace/select · session/select |
 | 轮转：成员 / 水位快照 | GET .../users |
 | 轮转：席位 / 订阅核对 | GET .../users/seat_type_counts、GET .../subscriptions |
+| 成员席位调整 | POST .../users/{user_id}/seat/update（Owner token；提交后回读成员席位） |
 | 轮转：账号分级 / 用量检测（含满额） | GET .../wham/usage（4.1、4.7）、GET .../me（+4.3/4.4/4.5） |
 | 轮转：踢人 | DELETE .../users/{user_id}（子号自退 / 母号兜底） |
 | 轮转：重登自退 | password/verify → mfa/verify → PKCE → DELETE |

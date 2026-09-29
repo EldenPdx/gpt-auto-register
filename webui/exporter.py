@@ -130,7 +130,8 @@ def _import_cffi_mime():
 # ──────────────────────── 核心：刷新 Codex access_token ────────────────────────
 
 
-def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -> dict:
+def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT,
+                        proxy: str = "") -> dict:
     """用 Codex refresh_token 换一组新的 access_token / id_token / refresh_token(滚动)。
 
     参考 any-auto-register/platforms/chatgpt/token_refresh.py 风格。
@@ -157,11 +158,14 @@ def refresh_codex_token(refresh_token: str, *, timeout: int = DEFAULT_TIMEOUT) -
         "Referer": "https://auth.openai.com/",
     }
 
+    proxy = str(proxy or "").strip()
+    if proxy.startswith("socks5://"):
+        proxy = "socks5h://" + proxy[len("socks5://"):]
     resp = cffi.post(
         OPENAI_TOKEN_ENDPOINT,
         headers=headers,
         data=body,
-        proxies=None,
+        proxies={"https": proxy, "http": proxy} if proxy else None,
         verify=False,
         timeout=timeout,
         impersonate="chrome110",
