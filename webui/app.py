@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ipaddress
+import hmac
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, export_formats, registrar, team  # noqa: E402
+from . import admin_auth, db, export_formats, registrar, team  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
 from mail_providers import (  # noqa: E402
@@ -58,6 +59,20 @@ logger = logging.getLogger("webui")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+
+
+@app.middleware("http")
+async def require_admin(request: Request, call_next):
+    if request.url.path.startswith("/api/") and request.url.path != "/api/auth/login":
+        session = admin_auth.get_session(request.cookies.get(admin_auth.COOKIE_NAME, ""))
+        if session is None:
+            return JSONResponse(status_code=401, content={"ok": False, "detail": "请先登录"})
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not hmac.compare_digest(
+            request.headers.get("x-csrf-token", ""), session["csrf_token"],
+        ):
+            return JSONResponse(status_code=403, content={"ok": False, "detail": "请求验证失败"})
+        request.state.admin_session = session
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -95,6 +110,16 @@ class ImportReq(BaseModel):
         description="邮箱来源（outlook / ...）。留空则按段数猜，"
                     "但 Outlook 和 Gmail 都是 4 段，猜不出来，建议前端必填",
     )
+
+
+class AdminLoginReq(BaseModel):
+    username: str = Field(..., max_length=64)
+    password: str = Field(..., max_length=1024)
+
+
+class AdminPasswordReq(BaseModel):
+    current_password: str = Field(..., max_length=1024)
+    new_password: str = Field(..., min_length=8, max_length=1024)
 
 
 class RegisterReq(BaseModel):
@@ -173,6 +198,41 @@ class TeamOffboardReq(BaseModel):
 
 
 # ──────────────────────── API ────────────────────────
+
+
+@app.post("/api/auth/login")
+def admin_login(req: AdminLoginReq, request: Request):
+    if req.username != "admin" or not admin_auth.verify_password(req.password):
+        raise HTTPException(401, "账号或密码错误")
+    token, csrf_token = admin_auth.create_session()
+    response = JSONResponse({"ok": True, "username": "admin", "csrf_token": csrf_token})
+    response.set_cookie(
+        admin_auth.COOKIE_NAME, token, max_age=admin_auth.SESSION_AGE,
+        httponly=True, secure=request.url.scheme == "https", samesite="strict",
+    )
+    return response
+
+
+@app.get("/api/auth/session")
+def admin_session(request: Request):
+    return {"ok": True, "username": "admin", "csrf_token": request.state.admin_session["csrf_token"]}
+
+
+@app.post("/api/auth/password")
+def admin_password(req: AdminPasswordReq, request: Request):
+    if not admin_auth.change_password(req.current_password, req.new_password):
+        raise HTTPException(401, "当前密码错误")
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(admin_auth.COOKIE_NAME)
+    return response
+
+
+@app.post("/api/auth/logout")
+def admin_logout(request: Request):
+    admin_auth.revoke_session(request.cookies[admin_auth.COOKIE_NAME])
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(admin_auth.COOKIE_NAME)
+    return response
 
 
 @app.get("/api/health")

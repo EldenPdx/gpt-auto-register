@@ -71,6 +71,12 @@ def init_db():
             value   TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS admin_sessions (
+            token_hash TEXT PRIMARY KEY,
+            csrf_token TEXT NOT NULL,
+            expires_at REAL NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS registered (
             email           TEXT PRIMARY KEY,
             password        TEXT,

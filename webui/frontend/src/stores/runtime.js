@@ -26,6 +26,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   let currentEs = null
   let autoEs = null
+  let reconnectTimer = null
+  let streamsActive = false
 
   function addLog(text, kind) {
     logs.value.push({ id: ++_logId, text, kind: kind ?? classify(text) })
@@ -86,6 +88,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   // ─── 自动跑号全局 SSE（app 启动时连一次，自动重连） ───
   function connectAutoStream() {
+    streamsActive = true
     if (autoEs) { try { autoEs.close() } catch (_) {} }
     const es = createSSE('/api/auto/stream', {
       state: (e) => {
@@ -118,13 +121,24 @@ export const useRuntimeStore = defineStore('runtime', () => {
       // 断线自动重连
       try { es.close() } catch (_) {}
       autoEs = null
-      setTimeout(connectAutoStream, 2000)
+      if (streamsActive) reconnectTimer = setTimeout(connectAutoStream, 2000)
     })
     autoEs = es
   }
 
+  function disconnectStreams() {
+    streamsActive = false
+    if (reconnectTimer) clearTimeout(reconnectTimer)
+    reconnectTimer = null
+    if (autoEs) autoEs.close()
+    if (currentEs) currentEs.close()
+    autoEs = null
+    currentEs = null
+    runningSingle.value = false
+  }
+
   return {
     logs, autoStatus, banner, lastRunResult, dataVersion, runningSingle,
-    addLog, clearLogs, bumpData, dismissBanner, streamRun, connectAutoStream,
+    addLog, clearLogs, bumpData, dismissBanner, streamRun, connectAutoStream, disconnectStreams,
   }
 })

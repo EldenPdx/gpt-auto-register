@@ -5,6 +5,7 @@ import AdminLayout from '@/layouts/AdminLayout.vue'
 
 <template>
   <el-config-provider :locale="zhCn">
-    <AdminLayout />
+    <router-view v-if="$route.name === 'login'" />
+    <AdminLayout v-else-if="$route.name" />
   </el-config-provider>
 </template>

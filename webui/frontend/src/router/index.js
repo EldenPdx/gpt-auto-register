@@ -1,10 +1,16 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 import NProgress from 'nprogress'
+import { getSession } from '@/api/auth'
 
 NProgress.configure({ showSpinner: false, trickleSpeed: 120, minimum: 0.15 })
 
 // hash 路由：不依赖后端做 SPA 回退，FastAPI / 未来 Gin 都零配置可用。
 const routes = [
+  {
+    path: '/login',
+    name: 'login',
+    component: () => import('@/views/Login.vue'),
+  },
   {
     path: '/',
     name: 'dashboard',
@@ -85,10 +91,16 @@ const router = createRouter({
 })
 
 // 路由切换顶部进度条
-router.beforeEach((to, from, next) => {
+router.beforeEach(async (to) => {
   NProgress.start()
-  if (to.meta?.title) document.title = `${to.meta.title} · Outlook Register`
-  next()
+  document.title = `${to.meta?.title || '管理员登录'} · Outlook Register`
+  if (to.name === 'login') return
+  try {
+    await getSession()
+  } catch (error) {
+    if (error.status === 401) return { name: 'login', query: { redirect: to.fullPath } }
+    throw error
+  }
 })
 router.afterEach(() => {
   NProgress.done()

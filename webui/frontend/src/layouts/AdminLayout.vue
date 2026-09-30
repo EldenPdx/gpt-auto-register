@@ -1,10 +1,12 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { ElMessage } from 'element-plus'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useThemeStore } from '@/stores/theme'
 import { useStatsStore } from '@/stores/stats'
 import { useRuntimeStore } from '@/stores/runtime'
+import { changePassword, logout } from '@/api/auth'
 
 const route = useRoute()
 const router = useRouter()
@@ -16,6 +18,29 @@ const { banner } = storeToRefs(runtime)
 
 const collapse = ref(false)
 const adDismissed = ref(false)
+const passwordDialog = ref(false)
+const passwordBusy = ref(false)
+const passwordForm = reactive({ current_password: '', new_password: '', confirm_password: '' })
+
+async function savePassword() {
+  if (passwordForm.new_password.length < 8) return ElMessage.warning('新密码至少 8 位')
+  if (passwordForm.new_password !== passwordForm.confirm_password) return ElMessage.warning('两次新密码不一致')
+  passwordBusy.value = true
+  try {
+    await changePassword(passwordForm)
+    ElMessage.success('密码已修改，请重新登录')
+    passwordDialog.value = false
+    await router.replace('/login')
+  } catch (error) { ElMessage.error(error.message) }
+  finally { passwordBusy.value = false }
+}
+
+async function signOut() {
+  try {
+    await logout()
+    await router.replace('/login')
+  } catch (error) { ElMessage.error(error.message) }
+}
 
 const GROUP_ORDER = ['概览', 'Team', '注册', '数据', '配置']
 const groups = computed(() => {
@@ -54,6 +79,10 @@ onMounted(() => {
   theme.apply()
   statsStore.startPolling()
   runtime.connectAutoStream()
+})
+onUnmounted(() => {
+  statsStore.stopPolling()
+  runtime.disconnectStreams()
 })
 </script>
 <template>
@@ -110,9 +139,11 @@ onMounted(() => {
             </span>
             <template #dropdown>
               <el-dropdown-menu>
+                <el-dropdown-item @click="passwordDialog = true">修改密码</el-dropdown-item>
                 <el-dropdown-item @click="theme.toggle">
                   {{ theme.dark ? '浅色模式' : '深色模式' }}
                 </el-dropdown-item>
+                <el-dropdown-item divided @click="signOut">退出登录</el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>
@@ -142,6 +173,14 @@ onMounted(() => {
         </router-view>
       </el-main>
     </el-container>
+    <el-dialog v-model="passwordDialog" title="修改管理员密码" width="min(420px, 90vw)" @closed="Object.assign(passwordForm, { current_password: '', new_password: '', confirm_password: '' })">
+      <el-form label-position="top" @submit.prevent="savePassword">
+        <el-form-item label="当前密码"><el-input v-model="passwordForm.current_password" type="password" show-password autocomplete="current-password" /></el-form-item>
+        <el-form-item label="新密码"><el-input v-model="passwordForm.new_password" type="password" show-password autocomplete="new-password" /></el-form-item>
+        <el-form-item label="确认新密码"><el-input v-model="passwordForm.confirm_password" type="password" show-password autocomplete="new-password" /></el-form-item>
+        <el-button type="primary" native-type="submit" :loading="passwordBusy">保存并重新登录</el-button>
+      </el-form>
+    </el-dialog>
   </el-container>
 </template>
 

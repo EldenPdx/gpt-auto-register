@@ -45,6 +45,10 @@ python start_webui.py
 # 浏览器自动打开 http://127.0.0.1:8765/
 ```
 
+WebUI 仅允许管理员登录，不提供注册。首次账号为 `admin`，密码为
+`xvanai666`；登录后可在右上角管理员菜单修改密码。修改后所有会话会退出，
+需要用新密码重新登录。管理员密码和会话保存在 `webui/webui.db` 中。
+
 #### Docker Compose 部署（支持热更新）
 
 ```bash

@@ -30,6 +30,11 @@ class TeamWorkspaceApiTest(unittest.TestCase):
         db.DB_PATH = Path(self._tmp.name) / "team-api.db"
         db.init_db()
         self.client = TestClient(app)
+        login = self.client.post("/api/auth/login", json={
+            "username": "admin", "password": "xvanai666",
+        })
+        self.assertEqual(login.status_code, 200, login.text)
+        self.client.headers.update({"x-csrf-token": login.json()["csrf_token"]})
 
     def tearDown(self) -> None:
         db.DB_PATH = self._old_path

@@ -7,11 +7,20 @@ import { ElMessage } from 'element-plus'
 // 留空 = 与前端同源（当前 FastAPI / 未来 Gin 都伺服在同一端口）。
 // ────────────────────────────────────────────────────────────
 export const API_BASE = import.meta.env.VITE_API_BASE || ''
+let csrfToken = ''
+export function setCsrfToken(token) { csrfToken = token || '' }
 
 const http = axios.create({
   baseURL: API_BASE,
   headers: { 'Content-Type': 'application/json' },
   timeout: 60000,
+})
+
+http.interceptors.request.use((config) => {
+  if (!['get', 'head', 'options'].includes(config.method?.toLowerCase())) {
+    config.headers['X-CSRF-Token'] = csrfToken
+  }
+  return config
 })
 
 // 统一解包 + 错误提示。后端约定：
@@ -23,6 +32,10 @@ const http = axios.create({
 http.interceptors.response.use(
   (resp) => resp.data,
   (error) => {
+    if (error?.response?.status === 401 && !error.config?.url?.startsWith('/api/auth/')) {
+      setCsrfToken('')
+      window.location.hash = '#/login'
+    }
     const data = error?.response?.data
     const detail =
       data?.detail ||
